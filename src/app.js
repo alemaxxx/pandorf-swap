@@ -15,10 +15,9 @@ import {
   parseUnits,
 } from "viem";
 import {
-  AmmoraSwapClient,
+  ammCompoundingPoolV3Abi as poolAbi,
   ammoraV3NativeRouterAbi,
   giwaSepoliaAutoRouteDeployment as deployment,
-  giwaSepoliaAutoRoutePoolProfiles,
 } from "@ammora-protocol/sdk";
 
 const RPC = "https://sepolia-rpc.giwa.io";
@@ -32,9 +31,9 @@ const chain = defineChain({
   blockExplorers: { default: { name: "GIWA Explorer", url: EXPLORER } },
 });
 
-// Native ETH router used by ammora.org for GIWA ARL pools (same ABI as the SDK's
-// ammoraV3NativeRouterAbi). The SDK 0.3.9 catalog router does not enable these pools yet,
-// so the SDK plans the quote on the WETH leg and this router wraps/unwraps ETH atomically.
+// Native ETH router used by ammora.org for GIWA ARL pools (SDK ABI: ammoraV3NativeRouterAbi).
+// The SDK 0.3.9 catalog router does not enable these pools yet, so quotes come straight from
+// the pool (SDK ABI: quoteExactIn) and this router wraps/unwraps ETH in the same transaction.
 const NATIVE_ROUTER = getAddress("0x4FC91b90087288520A7bB4aA7Ab5441bb4E9C496");
 const ZERO = "0x0000000000000000000000000000000000000000";
 
@@ -45,18 +44,10 @@ const MARKETS = [
     label: "tAMM / ETH",
     pool: getAddress("0x1EF92A6a9BB4bBed2b385Dd5E688F88e7965BCf8"),
     token: getAddress("0x10B3Cc2fc981277Ada576891CF649D0ABA768B06"),
-    model: "compounding",
   },
 ];
 
 const publicClient = createPublicClient({ chain, transport: http(RPC, { retryCount: 1 }) });
-let swapClientPromise;
-const swapClient = () =>
-  (swapClientPromise ??= AmmoraSwapClient.create(publicClient, {
-    deploymentCatalog: { [chain.id]: deployment },
-    factoryProfiles: giwaSepoliaAutoRoutePoolProfiles,
-  }));
-
 const tokenInfo = new Map();
 async function token(address) {
   const key = address.toLowerCase();
@@ -78,20 +69,12 @@ async function plan({ market, side, amount, payer, slippageBps }) {
   const buy = side === "buy";
   const amountIn = parseUnits(amount, buy ? 18 : t.decimals);
   if (amountIn <= 0n) throw new Error("Enter an amount greater than zero");
-  const client = await swapClient();
-  const sdkPlan = await client.prepareExactIn({
-    model: market.model,
-    pool: market.pool,
-    tokenIn: buy ? WETH : market.token,
-    inputAsset: "erc20",
-    outputAsset: "erc20",
-    amountIn,
-    payer,
-    recipient: payer,
-    slippageBps,
-    executionMode: "direct-wallet",
+  const expectedAmountOut = await publicClient.readContract({
+    address: market.pool, abi: poolAbi, functionName: "quoteExactIn", args: [buy ? WETH : market.token, amountIn],
   });
-  const q = sdkPlan.quote;
+  if (expectedAmountOut === 0n) throw new Error("Amount too small for this pool");
+  const minimumAmountOut = (expectedAmountOut * BigInt(10_000 - slippageBps)) / 10_000n;
+  const q = { expectedAmountOut, minimumAmountOut };
   const deadline = BigInt(Math.floor(Date.now() / 1000) + 20 * 60);
   const data = buy
     ? encodeFunctionData({ abi: ammoraV3NativeRouterAbi, functionName: "swapPoolExactInNative", args: [market.pool, q.minimumAmountOut, payer, deadline, ZERO] })
@@ -100,7 +83,7 @@ async function plan({ market, side, amount, payer, slippageBps }) {
     token: t,
     buy,
     amountIn,
-    quote: { expectedAmountOut: q.expectedAmountOut, minimumAmountOut: q.minimumAmountOut },
+    quote: q,
     tx: { to: NATIVE_ROUTER, data, value: buy ? amountIn : 0n },
     approval: buy ? null : { token: market.token, spender: NATIVE_ROUTER, amount: amountIn },
   };
@@ -278,21 +261,27 @@ async function swap() {
   }
 }
 
-function addCustomMarket(ev) {
+async function addCustomMarket(ev) {
   ev.preventDefault();
   const pool = $("c-pool").value.trim();
-  const tok = $("c-token").value.trim();
-  if (!isAddress(pool) || !isAddress(tok)) return setStatus("Enter valid pool and token addresses", "err");
-  token(getAddress(tok))
-    .then((t) => {
-      const m = { id: pool.toLowerCase(), label: `${t.symbol} / ETH`, pool: getAddress(pool), token: getAddress(tok), model: $("c-model").value };
-      if (!MARKETS.some((x) => x.id === m.id)) MARKETS.push(m);
-      state.market = m;
-      renderMarkets();
-      $("custom").open = false;
-      return refreshBalances().then(scheduleQuote);
-    })
-    .catch((e) => setStatus(cleanError(e), "err"));
+  if (!isAddress(pool)) return setStatus("Enter a valid pool address", "err");
+  try {
+    const [base, quote] = await Promise.all([
+      publicClient.readContract({ address: pool, abi: poolAbi, functionName: "baseToken" }),
+      publicClient.readContract({ address: pool, abi: poolAbi, functionName: "quoteToken" }),
+    ]);
+    if (getAddress(quote) !== WETH) throw new Error("Only ETH-quoted Ammora pools are supported");
+    const t = await token(getAddress(base));
+    const m = { id: pool.toLowerCase(), label: `${t.symbol} / ETH`, pool: getAddress(pool), token: t.address };
+    if (!MARKETS.some((x) => x.id === m.id)) MARKETS.push(m);
+    state.market = m;
+    renderMarkets();
+    $("custom").open = false;
+    await refreshBalances();
+    scheduleQuote();
+  } catch (e) {
+    setStatus(`Not a supported Ammora pool: ${cleanError(e)}`, "err");
+  }
 }
 
 function wire() {
