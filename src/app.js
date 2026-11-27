@@ -5,6 +5,7 @@ import {
   createPublicClient,
   createWalletClient,
   custom,
+  encodeFunctionData,
   defineChain,
   erc20Abi,
   formatUnits,
@@ -15,6 +16,7 @@ import {
 } from "viem";
 import {
   AmmoraSwapClient,
+  ammoraV3NativeRouterAbi,
   giwaSepoliaAutoRouteDeployment as deployment,
   giwaSepoliaAutoRoutePoolProfiles,
 } from "@ammora-protocol/sdk";
@@ -29,6 +31,12 @@ const chain = defineChain({
   rpcUrls: { default: { http: [RPC] } },
   blockExplorers: { default: { name: "GIWA Explorer", url: EXPLORER } },
 });
+
+// Native ETH router used by ammora.org for GIWA ARL pools (same ABI as the SDK's
+// ammoraV3NativeRouterAbi). The SDK 0.3.9 catalog router does not enable these pools yet,
+// so the SDK plans the quote on the WETH leg and this router wraps/unwraps ETH atomically.
+const NATIVE_ROUTER = getAddress("0x4FC91b90087288520A7bB4aA7Ab5441bb4E9C496");
+const ZERO = "0x0000000000000000000000000000000000000000";
 
 // Known markets. Any other Ammora pool can be added with the "custom pool" form.
 const MARKETS = [
@@ -64,26 +72,62 @@ async function token(address) {
   return tokenInfo.get(key);
 }
 
-/** Builds an SDK plan. side = "buy" (ETH → token) or "sell" (token → ETH). */
+/** Quote via the SDK on the WETH leg, then build the native-router transaction. */
 async function plan({ market, side, amount, payer, slippageBps }) {
   const t = await token(market.token);
   const buy = side === "buy";
   const amountIn = parseUnits(amount, buy ? 18 : t.decimals);
   if (amountIn <= 0n) throw new Error("Enter an amount greater than zero");
   const client = await swapClient();
-  const prepared = await client.prepareExactIn({
+  const sdkPlan = await client.prepareExactIn({
     model: market.model,
     pool: market.pool,
     tokenIn: buy ? WETH : market.token,
-    inputAsset: buy ? "native" : "erc20",
-    outputAsset: buy ? "erc20" : "native",
+    inputAsset: "erc20",
+    outputAsset: "erc20",
     amountIn,
     payer,
     recipient: payer,
     slippageBps,
     executionMode: "direct-wallet",
   });
-  return { prepared, token: t, buy, amountIn };
+  const q = sdkPlan.quote;
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + 20 * 60);
+  const data = buy
+    ? encodeFunctionData({ abi: ammoraV3NativeRouterAbi, functionName: "swapPoolExactInNative", args: [market.pool, q.minimumAmountOut, payer, deadline, ZERO] })
+    : encodeFunctionData({ abi: ammoraV3NativeRouterAbi, functionName: "swapPoolExactInForNative", args: [market.pool, market.token, amountIn, q.minimumAmountOut, payer, deadline, ZERO] });
+  return {
+    token: t,
+    buy,
+    amountIn,
+    quote: { expectedAmountOut: q.expectedAmountOut, minimumAmountOut: q.minimumAmountOut },
+    tx: { to: NATIVE_ROUTER, data, value: buy ? amountIn : 0n },
+    approval: buy ? null : { token: market.token, spender: NATIVE_ROUTER, amount: amountIn },
+  };
+}
+
+/** Sends approval (if needed) and the swap from the user's wallet, then waits for receipts. */
+async function execute(p, account, onStatus) {
+  await ensureChain(window.ethereum);
+  const wallet = createWalletClient({ account, chain, transport: custom(window.ethereum) });
+  if (p.approval) {
+    const allowance = await publicClient.readContract({ address: p.approval.token, abi: erc20Abi, functionName: "allowance", args: [account, p.approval.spender] });
+    if (allowance < p.approval.amount) {
+      onStatus("Approve the token in your wallet…");
+      const h = await wallet.writeContract({ address: p.approval.token, abi: erc20Abi, functionName: "approve", args: [p.approval.spender, p.approval.amount] });
+      onStatus("Waiting for approval…");
+      const r = await publicClient.waitForTransactionReceipt({ hash: h });
+      if (r.status !== "success") throw new Error("Approval failed");
+    }
+  }
+  onStatus("Simulating…");
+  await publicClient.call({ account, to: p.tx.to, data: p.tx.data, value: p.tx.value });
+  onStatus("Confirm the swap in your wallet…");
+  const hash = await wallet.sendTransaction({ to: p.tx.to, data: p.tx.data, value: p.tx.value });
+  onStatus("Waiting for confirmation…");
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  if (receipt.status !== "success") throw new Error("Swap reverted");
+  return { hash };
 }
 
 // ---------- UI ----------
@@ -150,7 +194,7 @@ async function runQuote() {
   setStatus("Fetching quote…");
   try {
     const payer = state.account ?? "0x000000000000000000000000000000000000dEaD";
-    const { prepared, token: t, buy } = await plan({
+    const p = await plan({
       market: state.market,
       side: state.side,
       amount,
@@ -158,10 +202,10 @@ async function runQuote() {
       slippageBps: Number($("slippage").value),
     });
     if ($("amount").value.trim() !== amount) return; // stale
-    const outDecimals = buy ? t.decimals : 18;
-    $("out").textContent = fmt(prepared.quote.expectedAmountOut, outDecimals);
-    $("min-out").textContent = `${fmt(prepared.quote.minimumAmountOut, outDecimals)} ${buy ? t.symbol : "ETH"}`;
-    state.prepared = prepared;
+    const outDecimals = p.buy ? p.token.decimals : 18;
+    $("out").textContent = fmt(p.quote.expectedAmountOut, outDecimals);
+    $("min-out").textContent = `${fmt(p.quote.minimumAmountOut, outDecimals)} ${p.buy ? p.token.symbol : "ETH"}`;
+    state.prepared = p;
     $("swap").disabled = !state.account;
     setStatus(state.account ? "Quote ready" : "Connect a wallet to swap", state.account ? "ok" : "");
   } catch (e) {
@@ -220,11 +264,7 @@ async function swap() {
   state.busy = true;
   $("swap").disabled = true;
   try {
-    await ensureChain(window.ethereum);
-    const wallet = createWalletClient({ account: state.account, chain, transport: custom(window.ethereum) });
-    const result = await state.prepared.execute(wallet, {
-      onStatus: (s) => setStatus(describe(s)),
-    });
+    const result = await execute(state.prepared, state.account, (t) => setStatus(t));
     const link = `${EXPLORER}/tx/${result.hash}`;
     $("status").innerHTML = `Swap confirmed · <a href="${link}" target="_blank" rel="noopener">view on explorer</a>`;
     $("status").className = "status ok";
@@ -236,20 +276,6 @@ async function swap() {
     state.busy = false;
     $("swap").disabled = !state.prepared;
   }
-}
-
-function describe(s) {
-  const k = s?.type || s?.status || s?.stage || "working";
-  const map = {
-    refreshing: "Refreshing quote…",
-    approving: "Approve the token in your wallet…",
-    "approval-confirmed": "Approval confirmed",
-    simulating: "Simulating…",
-    submitting: "Confirm the swap in your wallet…",
-    submitted: "Waiting for confirmation…",
-    confirmed: "Confirmed",
-  };
-  return map[k] || `${String(k).replace(/[-_]/g, " ")}…`;
 }
 
 function addCustomMarket(ev) {
@@ -298,19 +324,17 @@ function wire() {
   refreshBalances().catch((e) => setStatus(cleanError(e), "err"));
 }
 
-// Read-only helper for diagnostics: quote without a wallet.
+// Read-only helper for diagnostics: quote and simulate without signing.
 window.pandorfSwap = {
   async quote(side = "buy", amount = "0.0002", payer = "0x000000000000000000000000000000000000dEaD") {
-    const { prepared, token: t, buy } = await plan({ market: state.market, side, amount, payer, slippageBps: 100 });
-    const q = prepared.quote;
-    return {
-      side,
-      amountIn: amount,
-      expectedOut: formatUnits(q.expectedAmountOut, buy ? t.decimals : 18),
-      minimumOut: formatUnits(q.minimumAmountOut, buy ? t.decimals : 18),
-      to: prepared.transaction.to,
-      approvals: prepared.approvalRequirements.length,
-    };
+    const p = await plan({ market: state.market, side, amount, payer, slippageBps: 100 });
+    const d = p.buy ? p.token.decimals : 18;
+    let simulation = "skipped (needs allowance)";
+    if (!p.approval) {
+      try { await publicClient.call({ account: payer, to: p.tx.to, data: p.tx.data, value: p.tx.value }); simulation = "ok"; }
+      catch (e) { simulation = cleanError(e); }
+    }
+    return { side, amountIn: amount, expectedOut: formatUnits(p.quote.expectedAmountOut, d), minimumOut: formatUnits(p.quote.minimumAmountOut, d), simulation };
   },
 };
 
