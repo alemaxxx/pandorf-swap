@@ -11,6 +11,6 @@ app.use((_, res, next) => {
   next();
 });
 app.get("/health", (_, res) => res.json({ ok: true, app: "pandorf-swap" }));
-app.use(express.static(root, { maxAge: "5m" }));
+app.use(express.static(root, { setHeaders: (res) => res.setHeader("Cache-Control", "no-cache") }));
 const port = Number(process.env.PORT || 8080);
 app.listen(port, () => console.log(`pandorf-swap on :${port}`));
