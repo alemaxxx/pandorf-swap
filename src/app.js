@@ -252,6 +252,9 @@ async function swap() {
     $("status").innerHTML = `Swap confirmed · <a href="${link}" target="_blank" rel="noopener">view on explorer</a>`;
     $("status").className = "status ok";
     $("amount").value = "";
+    $("out").textContent = "0";
+    $("min-out").textContent = "—";
+    state.prepared = null;
     await refreshBalances();
   } catch (e) {
     setStatus(cleanError(e), "err");
