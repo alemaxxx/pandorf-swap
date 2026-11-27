@@ -1,0 +1,18 @@
+{
+  "name": "pandorf-swap",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal GIWA Sepolia exchange built on the Ammora SDK (Builder mission).",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "esbuild src/app.js --bundle --format=esm --target=es2022 --minify --sourcemap --outfile=public/app.js",
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@ammora-protocol/sdk": "0.3.9",
+    "esbuild": "^0.25.0",
+    "express": "^4.21.2",
+    "viem": "^2.33.0"
+  }
+}
